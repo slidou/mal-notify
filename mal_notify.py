@@ -107,45 +107,75 @@ def _clean(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 def parse_details(text, mal_id):
-    """Titre / type / statut / synopsis / image extraits de la fiche MAL."""
+    """Titre / type / statut / synopsis / image — multi-stratégies :
+    meta og: (stables), motifs texte insensibles aux classes CSS, secours.
+    En cas de champ manquant, un [diag] imprime l'extrait HTML exact
+    dans les logs (pour une correction factuelle, pas à l'aveugle)."""
+
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
-           "synopsis": "", "image": ""}
+           "volumes": "", "chapters": "", "synopsis": "", "image": ""}
 
-    h1 = soup.select_one("h1.title-name") or soup.select_one("h1")
-    if h1:
-        strong = h1.find("strong")          # cas standard MAL : <strong>Titre</strong>
-        if strong:
-            det["title"] = _clean(strong.get_text())
-        else:                               # sinon : premier nœud texte du h1 uniquement
-            first = h1.find(string=True)
-            det["title"] = _clean(first) if first else ""
+    # ------------------------------------------------------------------ titre
+    m = (re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', text)
+         or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', text))
+    if m:                                    # 1) meta og:title
+        t = html_lib.unescape(m.group(1))
+        t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
+        det["title"] = _clean(t)
+    if not det["title"]:                     # 2) h1, nettoyé du menu d'édition
+        h1 = soup.select_one("h1.title-name") or soup.select_one("h1")
+        if h1:
+            parts = []
+            for s in h1.stripped_strings:
+                if s.lower().rstrip(":") == "edit" or s.lower().startswith("what would you like"):
+                    break
+                parts.append(s)
+            det["title"] = _clean(" ".join(parts))
+    if not det["title"]:                     # 3) <title> de la page
+        m = re.search(r"<title>(.*?)</title>", text, re.S)
+        if m:
+            t = html_lib.unescape(m.group(1))
+            t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
+            det["title"] = _clean(t)
 
-    for row in soup.select("div.spaceit"):
-        label = row.select_one("span.dark_text")
-        if not label:
-            continue
-        key = _clean(label.get_text()).rstrip(":").lower()
-        val = _clean(row.get_text().replace(label.get_text(), "", 1))
-        if key == "type":
-            det["type"] = val or "?"
-        elif key == "status":
-            det["status"] = val or "?"
+    # ------------------------------------------- type / statut / vol. / ch.
+    # motif indépendant des classes CSS : « Libellé:</balise éventuelle> valeur »
+    for label, field in (("Type", "type"), ("Status", "status"),
+                         ("Volumes", "volumes"), ("Chapters", "chapters")):
+        m = re.search(label + r":\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
+        if m:
+            det[field] = _clean(html_lib.unescape(m.group(1)))
 
-    p = soup.select_one('p[itemprop="description"]')
+    # -------------------------------------------------------------- synopsis
+    p = (soup.select_one('p[itemprop="description"]')
+         or soup.select_one('span[itemprop="description"]'))
     if p:
         det["synopsis"] = (_clean(p.get_text())
                            .replace("[Written by MAL Rewrite]", "").strip())
+    if not det["synopsis"]:                  # secours : meta og:description
+        m = (re.search(r'property=["\']og:description["\']\s+content=["\']([^"\']+)', text)
+             or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', text))
+        if m:
+            s = html_lib.unescape(m.group(1)).replace("\r", " ").replace("\n", " ")
+            det["synopsis"] = _clean(s.replace("**", ""))
 
+    # ----------------------------------------------------------------- image
     m = (re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)', text)
          or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', text))
     if m:
         det["image"] = m.group(1)
 
-    if not det["title"]:
-        m = re.search(r"<title>(.*?)\s*[-–]\s*MyAnimeList", text)
-        if m:
-            det["title"] = _clean(html_lib.unescape(m.group(1)))
+    # ------------------------------------------- diagnostic auto si besoin
+    manquants = [k for k, v in (("titre", det["title"]), ("type", det["type"]),
+                                ("statut", det["status"])) if not v or v == "?"]
+    if manquants:
+        print(f"  [diag #{mal_id}] non trouvés : {', '.join(manquants)}")
+        for marqueur in ('og:title', "<h1", "Type:", "Status:"):
+            i = text.find(marqueur)
+            if i >= 0:
+                extrait = text[max(0, i - 40):i + 260].replace("\n", " ")
+                print(f"  [diag] {extrait[:300]}")
     return det
 
 def fetch_entry(mal_id):
