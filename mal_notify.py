@@ -114,7 +114,12 @@ def parse_details(text, mal_id):
 
     h1 = soup.select_one("h1.title-name") or soup.select_one("h1")
     if h1:
-        det["title"] = _clean(h1.get_text())
+        strong = h1.find("strong")          # cas standard MAL : <strong>Titre</strong>
+        if strong:
+            det["title"] = _clean(strong.get_text())
+        else:                               # sinon : premier nœud texte du h1 uniquement
+            first = h1.find(string=True)
+            det["title"] = _clean(first) if first else ""
 
     for row in soup.select("div.spaceit"):
         label = row.select_one("span.dark_text")
