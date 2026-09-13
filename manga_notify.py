@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""mal-notify (manga) — même architecture que la version anime, sans Jikan :
-la page « nouvelles entrées » manga et les fiches myanimelist.net/manga/<ID>
-sont lues directement sur MAL ; les entrées non validées attendent en file.
+"""mal-notify (manga) — même architecture que la version anime, sans Jikan.
 
+Type / chapters / volumes viennent de la table de résultats de la page de
+recherche (rendue côté serveur) ; titre/synopsis/image de la fiche.
 État indépendant : state_manga.json.
 Webhook : WEBHOOK_MANGA_URL si défini, sinon WEBHOOK_URL (salon animes).
 """
@@ -33,10 +33,8 @@ WATCH_TTL_DAYS = 60
 WATCH_ALERT_SIZE = 60
 ALERT_AFTER = 20
 
-# valeurs possibles (MAL rend certains champs en JavaScript : on cherche
-# ces valeurs littérales dans la page pour retrouver les vraies données)
 STATUTS = ("Not yet published", "Publishing", "Discontinued", "On Hiatus", "Finished")
-TYPES   = ("Manga", "Manhwa", "Manhua", "Novel", "Light Novel", "One-shot", "Doujinshi")
+TYPES   = ("Light Novel", "One-shot", "Manhwa", "Manhua", "Novel", "Manga", "Doujinshi")
 
 PENDING_HINTS = [
     "pending approval",
@@ -90,28 +88,59 @@ def get_page(url):
     raise RuntimeError(last)
 
 def scrape_window():
-    """IDs visibles sur la page des nouvelles entrées manga."""
-    ids = []
+    """IDs + infos de ligne (type, chapters, volumes) de la table des résultats,
+    rendue côté serveur. Renvoie (ids, infos) — ids du plus récent au plus
+    ancien, sans doublon ; infos = {id: {type, ch, vol}}."""
+    rows, sample = [], ""
     for show in SHOW_OFFSETS:
         url = MANGA_PAGE if show == 0 else f"{MANGA_PAGE}&show={show}"
         text, code = get_page(url)
         if code != 200:
             raise RuntimeError(f"page de recherche illisible (HTTP {code})")
-        text = text.split('id="content"', 1)[-1]
-        ids += re.findall(r'href="[^"]*/manga/(\d+)/', text)
+        content = text.split('id="content"', 1)[-1]
+        soup = BeautifulSoup(content, "html.parser")
+        for tr in soup.find_all("tr"):
+            a = tr.find("a", href=re.compile(r"/manga/\d+/"))
+            if not a:
+                continue
+            m = re.search(r"/manga/(\d+)/", a["href"])
+            if not m:
+                continue
+            row = {"id": m.group(1)}
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            for i, td in enumerate(tds):
+                if td in TYPES:                      # cellule Type de MAL
+                    row["type"] = td
+                    ch  = tds[i + 1] if i + 1 < len(tds) else ""   # chapters
+                    vol = tds[i + 2] if i + 2 < len(tds) else ""   # volumes
+                    row["ch"]  = ch  if re.fullmatch(r"\d+", ch)  else "?"
+                    row["vol"] = vol if re.fullmatch(r"\d+", vol) else "?"
+                    break
+            if "type" not in row:                   # secours regex sur la ligne
+                toks = re.findall(r">\s*(Light Novel|One-shot|Manhwa|Manhua|"
+                                  r"Novel|Manga|Doujinshi)\s*<", str(tr))
+                if toks:
+                    row["type"] = toks[-1]          # la cellule Type vient après le titre
+            if "type" not in row and not sample:
+                sample = str(tr)[:500]
+            rows.append(row)
         time.sleep(1.2)
-    return list(dict.fromkeys(ids))
+    if rows and not any("type" in r for r in rows) and sample:
+        print("  [diag table] aucun type trouvé dans les résultats — extrait d'une ligne :")
+        print(f"  [diag table] {sample}")
+    ids = list(dict.fromkeys(r["id"] for r in rows))
+    infos = {}
+    for r in rows:
+        infos.setdefault(r["id"], r)
+    return ids, infos
 
 # ------------------------------------------------------------------ parsing
 def _clean(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 def parse_details(text, mal_id):
-    """Titre / type / statut / volumes / chapitres / synopsis / image —
-    multi-stratégies : meta og:, motifs texte, valeurs littérales connues,
-    JSON embarqué. Les gabarits JavaScript non rendus
-    (« ${ item.payload.status } ») sont rejetés. Un [diag] imprime l'extrait
-    HTML exact en cas de champ manquant (correction factuelle)."""
+    """Titre / synopsis / image / statut depuis la fiche (multi-stratégies).
+    Type / chapters / volumes viennent de la table de recherche."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
@@ -120,11 +149,11 @@ def parse_details(text, mal_id):
     # ------------------------------------------------------------------ titre
     m = (re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', text)
          or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', text))
-    if m:                                    # 1) meta og:title
+    if m:
         t = html_lib.unescape(m.group(1))
         t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
         det["title"] = _clean(t)
-    if not det["title"]:                     # 2) h1, nettoyé du menu d'édition
+    if not det["title"]:
         h1 = soup.select_one("h1.title-name") or soup.select_one("h1")
         if h1:
             parts = []
@@ -133,49 +162,21 @@ def parse_details(text, mal_id):
                     break
                 parts.append(s)
             det["title"] = _clean(" ".join(parts))
-    if not det["title"]:                     # 3) <title> de la page
+    if not det["title"]:
         m = re.search(r"<title>(.*?)</title>", text, re.S)
         if m:
             t = html_lib.unescape(m.group(1))
             t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
             det["title"] = _clean(t)
 
-    # ------------------------------- type / statut / volumes / chapitres
-    def _brut(label):
-        """Valeur après « Libellé: » ; gabarits JS non rendus exclus."""
-        m = re.search(label + r":\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
-        if m:
-            v = _clean(html_lib.unescape(m.group(1)))
-            return "" if "${" in v else v
-        return ""
-
-    def _json(cle, autorises=None):
-        """Valeur d'une clé dans un JSON éventuellement embarqué dans la page.
-        Une page contient souvent PLUSIEURS occurrences de la clé (config du
-        lecteur, analytics…) : on les parcourt TOUTES et on renvoie la première
-        valeur plausible — et, si des valeurs autorisées sont fournies, la
-        première qui en fait partie."""
-        for m in re.finditer(r'"' + cle + r'"\s*:\s*"?([^",}\]]+)', text):
-            v = _clean(html_lib.unescape(m.group(1)))
-            if not v or "${" in v or v.lower() == "null" or "payload" not in v.lower() and False:
-                continue
-            if autorises is not None and v not in autorises:
-                continue
-            return v
-        return ""
-
-    det["type"] = _brut("Type") or _json("type", TYPES) or "?"
-    det["chapters"] = (_brut("Chapters") or _json("chapters")
-                       or _json("num_chapters") or "?")
-    det["volumes"] = (_brut("Volumes") or _json("volumes")
-                      or _json("num_volumes") or "?")
-
-    statut = _brut("Status")
-    if not statut:                           # valeur littérale dans la page
-        statut = next((s for s in STATUTS if s in text), "")
-    if not statut:                           # JSON embarqué éventuel
-        statut = _json("status", STATUTS)
-    det["status"] = statut or "?"
+    # --------------------------------------------------------------- statut
+    m = re.search(r"Status:\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
+    if m:
+        v = _clean(html_lib.unescape(m.group(1)))
+        if "${" not in v:
+            det["status"] = v or "?"
+    if det["status"] == "?":
+        det["status"] = next((s for s in STATUTS if s in text), "?")
 
     # -------------------------------------------------------------- synopsis
     p = (soup.select_one('p[itemprop="description"]')
@@ -183,7 +184,7 @@ def parse_details(text, mal_id):
     if p:
         det["synopsis"] = (_clean(p.get_text())
                            .replace("[Written by MAL Rewrite]", "").strip())
-    if not det["synopsis"]:                  # secours : meta og:description
+    if not det["synopsis"]:
         m = (re.search(r'property=["\']og:description["\']\s+content=["\']([^"\']+)', text)
              or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', text))
         if m:
@@ -197,20 +198,11 @@ def parse_details(text, mal_id):
         det["image"] = m.group(1)
 
     # ------------------------------------------- diagnostic auto si besoin
-    manquants = [k for k, v in (("titre", det["title"]), ("type", det["type"]),
-                                ("statut", det["status"])) if not v or v == "?"]
-    if manquants:
-        print(f"  [diag #{mal_id}] non trouvés : {', '.join(manquants)}")
-        if "type" in manquants:              # preuves : toutes les valeurs « type »
-            cands = [_clean(html_lib.unescape(m.group(1)))
-                     for m in re.finditer(r'"type"\s*:\s*"?([^",}\]]+)', text)]
-            print(f'  [diag] valeurs "type" présentes dans la page : '
-                  f'{[c for c in cands if c and "${" not in c][:10]}')
-        for marqueur in ('og:title', '<h1', 'Type:', 'Status:', '"status"'):
-            i = text.find(marqueur)
-            if i >= 0:
-                extrait = text[max(0, i - 40):i + 260].replace("\n", " ")
-                print(f"  [diag] {extrait[:300]}")
+    if not det["title"]:
+        print(f"  [diag #{mal_id}] titre introuvable")
+        i = text.find("og:title")
+        if i >= 0:
+            print(f"  [diag] {text[max(0, i-40):i+260].replace(chr(10), ' ')[:300]}")
     return det
 
 def fetch_entry(mal_id):
@@ -241,7 +233,18 @@ def send_embed(embed):
     print(f"!! échec d'envoi Discord : {embed.get('title')}")
     return False
 
-def announce(det):
+def announce(det, row=None):
+    row = row or {}
+    typ = det.get("type") or "?"
+    if typ == "?":
+        typ = row.get("type") or "?"          # type de la table de recherche
+    statut = det.get("status") or "?"
+    ch = det.get("chapters") or "?"
+    if ch == "?":
+        ch = row.get("ch") or "?"
+    vol = det.get("volumes") or "?"
+    if vol == "?":
+        vol = row.get("vol") or "?"
     embed = {
         "title": det.get("title") or f"Nouvelle entrée #{det['mal_id']}",
         "url": f"{MANGA_BASE}{det['mal_id']}",
@@ -250,20 +253,20 @@ def announce(det):
     }
     if det.get("synopsis"):
         s = det["synopsis"]
-        if len(s) > 500:                         # coupure propre sur un mot
+        if len(s) > 500:
             s = s[:500].rsplit(" ", 1)[0] + "…"
         embed["description"] = s
-    embed["fields"] = [                          # toujours affichés, « ? » si inconnu
-        {"name": "Type",     "value": det.get("type")     or "?", "inline": True},
-        {"name": "Statut",   "value": det.get("status")   or "?", "inline": True},
-        {"name": "Chapters", "value": det.get("chapters") or "?", "inline": True},
-        {"name": "Volumes",  "value": det.get("volumes")  or "?", "inline": True},
+    embed["fields"] = [
+        {"name": "Type",     "value": typ,    "inline": True},
+        {"name": "Statut",   "value": statut, "inline": True},
+        {"name": "Chapters", "value": ch,     "inline": True},
+        {"name": "Volumes",  "value": vol,    "inline": True},
     ]
     if det.get("image"):
-        embed["image"] = {"url": det["image"]}   # grande image SOUS l'embed
+        embed["image"] = {"url": det["image"]}
     ok = send_embed(embed)
     if ok:
-        print(f"  -> notifié : #{det['mal_id']} — {embed['title']}")
+        print(f"  -> notifié : #{det['mal_id']} — {embed['title']} (type : {typ})")
     return ok
 
 # ------------------------------------------------------------------ main
@@ -272,7 +275,7 @@ def main():
 
     # 1) fenêtre des nouvelles entrées --------------------------------------
     try:
-        window = scrape_window()
+        window, infos = scrape_window()
         if len(window) < 10:
             raise RuntimeError(f"seulement {len(window)} entrées lues (parsing cassé ?)")
     except Exception as exc:
@@ -336,18 +339,19 @@ def main():
             break
         fetches += 1
         time.sleep(1.4)
+        row = infos.get(mal_id) or watch.get(mal_id, {}).get("row") or {}
         classe, det = fetch_entry(mal_id)
         if classe == "approved":
-            if announce(det):
+            if announce(det, row):
                 notified.add(mal_id)
                 watch.pop(mal_id, None)
                 sent += 1
         elif classe == "error":
             print(f"  #{mal_id} : lecture impossible ({det.get('error', '?')})")
-            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0})
+            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0, "row": row})
             info["since"] = now.isoformat()
         else:
-            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0})
+            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0, "row": row})
             info["tries"] += 1
             raison = ("page absente" if classe == "missing"
                       else f"en attente de validation ({det.get('hint')})")
