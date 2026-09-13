@@ -23,7 +23,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # ------------------------------------------------------------------ réglages
-MAL_PAGE = "https://myanimelist.net/anime.php?o=9&c%5B0%5D=a&c%5B1%5D=d&cv=2&w=1"
+MAL_PAGE = "https://myanimelist.net/anime.php?o=9&c%5B0%5D=a&c%5B1%5D=b&cv=2&w=1"
 MAL_ANIME = "https://myanimelist.net/anime/"
 WEBHOOK = os.environ["WEBHOOK_URL"]
 
