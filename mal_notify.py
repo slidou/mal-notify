@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """mal-notify v2 — plus aucune dépendance à Jikan : tout est lu sur MAL en direct.
 
-  1. la page « nouvelles entrées » est scrapée (curl_cffi & co) ;
-  2. pour chaque ID inconnu, la fiche myanimelist.net/anime/<ID> est chargée
-     elle aussi directement ;
+  1. la page « nouvelles entrées » est scrapée : IDs + infos de LIGNE
+     (type, épisodes) de la table de résultats — rendue côté serveur ;
+  2. pour chaque ID inconnu, la fiche myanimelist.net/anime/<ID> est chargée :
+     titre/synopsis/image via les meta og:, statut via valeur littérale ;
   3. fiche introuvable (404) ou marquée « pending approval » -> file d'attente,
      re-vérifiée en rotation à chaque run ;
-  4. fiche normale -> notif Discord (titre, type, statut, épisodes, synopsis,
-     image extraits de la page, multi-stratégies + auto-diagnostic).
+  4. fiche normale -> notif Discord (type/épisodes de la table, reste de la
+     fiche) + auto-diagnostic [diag] si un champ manque.
 """
 
 import html as html_lib
@@ -36,12 +37,9 @@ WATCH_TTL_DAYS = 60    # abandon des entrées jamais validées
 WATCH_ALERT_SIZE = 60  # alerte Discord si la file dépasse cette taille
 ALERT_AFTER = 20       # runs d'affilée sans lecture de MAL avant alerte
 
-# valeurs possibles (MAL rend certains champs en JavaScript : on cherche
-# ces valeurs littérales dans la page pour retrouver les vraies données)
 STATUTS = ("Currently Airing", "Finished Airing", "Not yet aired")
-TYPES   = ("TV", "Movie", "OVA", "ONA", "Special", "Music", "TV Special")
+TYPES   = ("TV Special", "TV", "Movie", "OVA", "ONA", "Special", "Music")
 
-# formulations signalant une entrée pas encore validée (en minuscules)
 PENDING_HINTS = [
     "pending approval",
     "not yet been approved",
@@ -95,28 +93,58 @@ def get_page(url):
     raise RuntimeError(last)
 
 def scrape_window():
-    """IDs visibles sur la page des nouvelles entrées, du plus récent au plus ancien."""
-    ids = []
+    """IDs + infos de ligne (type, épisodes) de la table des résultats,
+    rendue côté serveur. Renvoie (ids, infos) — ids du plus récent au plus
+    ancien, sans doublon ; infos = {id: {type, eps}}."""
+    rows, sample = [], ""
     for show in SHOW_OFFSETS:
         url = MAL_PAGE if show == 0 else f"{MAL_PAGE}&show={show}"
         text, code = get_page(url)
         if code != 200:
             raise RuntimeError(f"page de recherche illisible (HTTP {code})")
-        text = text.split('id="content"', 1)[-1]
-        ids += re.findall(r'href="[^"]*/anime/(\d+)/', text)
+        content = text.split('id="content"', 1)[-1]
+        soup = BeautifulSoup(content, "html.parser")
+        for tr in soup.find_all("tr"):
+            a = tr.find("a", href=re.compile(r"/anime/\d+/"))
+            if not a:
+                continue
+            m = re.search(r"/anime/(\d+)/", a["href"])
+            if not m:
+                continue
+            row = {"id": m.group(1)}
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            for i, td in enumerate(tds):
+                if td in TYPES:                      # cellule Type de MAL
+                    row["type"] = td
+                    eps = tds[i + 1] if i + 1 < len(tds) else ""   # colonne Eps
+                    row["eps"] = eps if re.fullmatch(r"\d+", eps) else "?"
+                    break
+            if "type" not in row:                   # secours regex sur la ligne
+                toks = re.findall(r">\s*(TV Special|TV|Movie|OVA|ONA|Special|Music)\s*<",
+                                  str(tr))
+                if toks:
+                    row["type"] = toks[-1]          # la cellule Type vient après le titre
+            if "type" not in row and not sample:
+                sample = str(tr)[:500]
+            rows.append(row)
         time.sleep(1.2)
-    return list(dict.fromkeys(ids))
+    if rows and not any("type" in r for r in rows) and sample:
+        print("  [diag table] aucun type trouvé dans les résultats — extrait d'une ligne :")
+        print(f"  [diag table] {sample}")
+    ids = list(dict.fromkeys(r["id"] for r in rows))
+    infos = {}
+    for r in rows:
+        infos.setdefault(r["id"], r)
+    return ids, infos
 
 # ------------------------------------------------------------------ parsing
 def _clean(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 def parse_details(text, mal_id):
-    """Titre / type / statut / épisodes / synopsis / image — multi-stratégies :
-    meta og: (stables), motifs texte insensibles aux classes CSS, valeurs
-    littérales connues, JSON embarqué. Les gabarits JavaScript non rendus
-    (« ${ item.payload.status } ») sont rejetés. Un [diag] imprime l'extrait
-    HTML exact en cas de champ manquant (correction factuelle, pas à l'aveugle)."""
+    """Titre / synopsis / image / statut depuis la fiche (multi-stratégies).
+    Le type et les épisodes viennent de la table de recherche (voir
+    scrape_window) — MAL ne sert pas ces champs en HTML sur la fiche."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
@@ -125,11 +153,11 @@ def parse_details(text, mal_id):
     # ------------------------------------------------------------------ titre
     m = (re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', text)
          or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:title["\']', text))
-    if m:                                    # 1) meta og:title
+    if m:
         t = html_lib.unescape(m.group(1))
         t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
         det["title"] = _clean(t)
-    if not det["title"]:                     # 2) h1, nettoyé du menu d'édition
+    if not det["title"]:
         h1 = soup.select_one("h1.title-name") or soup.select_one("h1")
         if h1:
             parts = []
@@ -138,47 +166,21 @@ def parse_details(text, mal_id):
                     break
                 parts.append(s)
             det["title"] = _clean(" ".join(parts))
-    if not det["title"]:                     # 3) <title> de la page
+    if not det["title"]:
         m = re.search(r"<title>(.*?)</title>", text, re.S)
         if m:
             t = html_lib.unescape(m.group(1))
             t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
             det["title"] = _clean(t)
 
-    # --------------------------------------- type / statut / épisodes
-    def _brut(label):
-        """Valeur après « Libellé: » ; gabarits JS non rendus exclus."""
-        m = re.search(label + r":\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
-        if m:
-            v = _clean(html_lib.unescape(m.group(1)))
-            return "" if "${" in v else v
-        return ""
-
-    def _json(cle, autorises=None):
-        """Valeur d'une clé dans un JSON éventuellement embarqué dans la page.
-        Une page contient souvent PLUSIEURS occurrences de la clé (config du
-        lecteur vidéo, analytics…) : on les parcourt TOUTES et on renvoie la
-        première valeur plausible — et, si des valeurs autorisées sont
-        fournies, la première qui en fait partie."""
-        for m in re.finditer(r'"' + cle + r'"\s*:\s*"?([^",}\]]+)', text):
-            v = _clean(html_lib.unescape(m.group(1)))
-            if not v or "${" in v or v.lower() == "null" or "payload" in v.lower():
-                continue
-            if autorises is not None and v not in autorises:
-                continue
-            return v
-        return ""
-
-    det["type"] = _brut("Type") or _json("type", TYPES) or "?"
-    det["episodes"] = (_brut("Episodes") or _json("episodes")
-                       or _json("num_episodes") or "?")
-
-    statut = _brut("Status")
-    if not statut:                           # valeur littérale dans la page
-        statut = next((s for s in STATUTS if s in text), "")
-    if not statut:                           # JSON embarqué éventuel
-        statut = _json("status", STATUTS)
-    det["status"] = statut or "?"
+    # --------------------------------------------------------------- statut
+    m = re.search(r"Status:\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
+    if m:
+        v = _clean(html_lib.unescape(m.group(1)))
+        if "${" not in v:
+            det["status"] = v or "?"
+    if det["status"] == "?":
+        det["status"] = next((s for s in STATUTS if s in text), "?")
 
     # -------------------------------------------------------------- synopsis
     p = (soup.select_one('p[itemprop="description"]')
@@ -186,7 +188,7 @@ def parse_details(text, mal_id):
     if p:
         det["synopsis"] = (_clean(p.get_text())
                            .replace("[Written by MAL Rewrite]", "").strip())
-    if not det["synopsis"]:                  # secours : meta og:description
+    if not det["synopsis"]:
         m = (re.search(r'property=["\']og:description["\']\s+content=["\']([^"\']+)', text)
              or re.search(r'content=["\']([^"\']+)["\']\s+property=["\']og:description["\']', text))
         if m:
@@ -200,20 +202,11 @@ def parse_details(text, mal_id):
         det["image"] = m.group(1)
 
     # ------------------------------------------- diagnostic auto si besoin
-    manquants = [k for k, v in (("titre", det["title"]), ("type", det["type"]),
-                                ("statut", det["status"])) if not v or v == "?"]
-    if manquants:
-        print(f"  [diag #{mal_id}] non trouvés : {', '.join(manquants)}")
-        if "type" in manquants:              # preuves : toutes les valeurs « type »
-            cands = [_clean(html_lib.unescape(m.group(1)))
-                     for m in re.finditer(r'"type"\s*:\s*"?([^",}\]]+)', text)]
-            print(f'  [diag] valeurs "type" présentes dans la page : '
-                  f'{[c for c in cands if c and "${" not in c][:10]}')
-        for marqueur in ('og:title', '<h1', 'Type:', 'Status:', '"status"'):
-            i = text.find(marqueur)
-            if i >= 0:
-                extrait = text[max(0, i - 40):i + 260].replace("\n", " ")
-                print(f"  [diag] {extrait[:300]}")
+    if not det["title"]:
+        print(f"  [diag #{mal_id}] titre introuvable")
+        i = text.find("og:title")
+        if i >= 0:
+            print(f"  [diag] {text[max(0, i-40):i+260].replace(chr(10), ' ')[:300]}")
     return det
 
 def fetch_entry(mal_id):
@@ -244,7 +237,15 @@ def send_embed(embed):
     print(f"!! échec d'envoi Discord : {embed.get('title')}")
     return False
 
-def announce(det):
+def announce(det, row=None):
+    row = row or {}
+    typ = det.get("type") or "?"
+    if typ == "?":
+        typ = row.get("type") or "?"          # type de la table de recherche
+    statut = det.get("status") or "?"
+    eps = det.get("episodes") or "?"
+    if eps == "?":
+        eps = row.get("eps") or "?"           # épisodes de la table de recherche
     embed = {
         "title": det.get("title") or f"Nouvelle entrée #{det['mal_id']}",
         "url": f"{MAL_ANIME}{det['mal_id']}",
@@ -253,19 +254,19 @@ def announce(det):
     }
     if det.get("synopsis"):
         s = det["synopsis"]
-        if len(s) > 500:                         # coupure propre sur un mot
+        if len(s) > 500:
             s = s[:500].rsplit(" ", 1)[0] + "…"
         embed["description"] = s
-    embed["fields"] = [                          # toujours affichés, « ? » si inconnu
-        {"name": "Type",     "value": det.get("type")     or "?", "inline": True},
-        {"name": "Statut",   "value": det.get("status")   or "?", "inline": True},
-        {"name": "Épisodes", "value": det.get("episodes") or "?", "inline": True},
+    embed["fields"] = [
+        {"name": "Type",     "value": typ,    "inline": True},
+        {"name": "Statut",   "value": statut, "inline": True},
+        {"name": "Épisodes", "value": eps,    "inline": True},
     ]
     if det.get("image"):
-        embed["image"] = {"url": det["image"]}   # grande image SOUS l'embed
+        embed["image"] = {"url": det["image"]}
     ok = send_embed(embed)
     if ok:
-        print(f"  -> notifié : #{det['mal_id']} — {embed['title']}")
+        print(f"  -> notifié : #{det['mal_id']} — {embed['title']} (type : {typ})")
     return ok
 
 # ------------------------------------------------------------------ main
@@ -274,7 +275,7 @@ def main():
 
     # 1) fenêtre des nouvelles entrées --------------------------------------
     try:
-        window = scrape_window()
+        window, infos = scrape_window()
         if len(window) < 10:
             raise RuntimeError(f"seulement {len(window)} entrées lues (parsing cassé ?)")
     except Exception as exc:
@@ -315,12 +316,11 @@ def main():
             del watch[mal_id]
             notified.add(mal_id)
 
-    # 4) file d'attente anormalement grande ? (le piège à silence de Jikan) --
+    # 4) file d'attente anormalement grande ? --------------------------------
     if len(watch) > WATCH_ALERT_SIZE and not state.get("watch_alerted"):
         send_embed({"title": "⚠️ mal-notify : file d'attente suspicieusement grande",
                     "description": f"{len(watch)} entrées bloquées en attente. Vérifie "
-                                   "les logs (onglet Actions) : MAL refuse peut-être "
-                                   "ses pages au bot.",
+                                   "les logs (onglet Actions) du repo.",
                     "color": 0xE67E22})
         state["watch_alerted"] = True
     elif len(watch) < 30:
@@ -330,7 +330,7 @@ def main():
     fresh = [i for i in window if i not in notified and i not in watch]
     print(f"{len(fresh)} nouvel(s) ID, {len(watch)} en file d'attente")
 
-    queue = list(reversed(fresh))                                    # ancien -> récent
+    queue = list(reversed(fresh))
     queue += sorted(watch, key=lambda i: watch[i].get("since", ""))[:WATCH_ROTATION]
 
     fetches = sent = 0
@@ -339,18 +339,19 @@ def main():
             break
         fetches += 1
         time.sleep(1.4)
+        row = infos.get(mal_id) or watch.get(mal_id, {}).get("row") or {}
         classe, det = fetch_entry(mal_id)
         if classe == "approved":
-            if announce(det):
+            if announce(det, row):
                 notified.add(mal_id)
                 watch.pop(mal_id, None)
                 sent += 1
         elif classe == "error":
             print(f"  #{mal_id} : lecture impossible ({det.get('error', '?')})")
-            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0})
-            info["since"] = now.isoformat()      # repasse en fin de rotation
+            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0, "row": row})
+            info["since"] = now.isoformat()
         else:
-            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0})
+            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0, "row": row})
             info["tries"] += 1
             raison = ("page absente" if classe == "missing"
                       else f"en attente de validation ({det.get('hint')})")
