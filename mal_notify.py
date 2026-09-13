@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """mal-notify v2 — plus aucune dépendance à Jikan : tout est lu sur MAL en direct.
 
-  1. la page « nouvelles entrées » est scrapée comme avant (curl_cffi & co) ;
+  1. la page « nouvelles entrées » est scrapée (curl_cffi & co) ;
   2. pour chaque ID inconnu, la fiche myanimelist.net/anime/<ID> est chargée
      elle aussi directement ;
   3. fiche introuvable (404) ou marquée « pending approval » -> file d'attente,
      re-vérifiée en rotation à chaque run ;
-  4. fiche normale -> notif Discord (titre, type, statut, synopsis, image
-     extraits de la page elle-même).
+  4. fiche normale -> notif Discord (titre, type, statut, épisodes, synopsis,
+     image extraits de la page elle-même, multi-stratégies + auto-diagnostic).
 """
 
 import html as html_lib
@@ -107,14 +107,14 @@ def _clean(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 def parse_details(text, mal_id):
-    """Titre / type / statut / synopsis / image — multi-stratégies :
+    """Titre / type / statut / épisodes / synopsis / image — multi-stratégies :
     meta og: (stables), motifs texte insensibles aux classes CSS, secours.
     En cas de champ manquant, un [diag] imprime l'extrait HTML exact
     dans les logs (pour une correction factuelle, pas à l'aveugle)."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
-           "volumes": "", "chapters": "", "synopsis": "", "image": ""}
+           "episodes": "", "synopsis": "", "image": ""}
 
     # ------------------------------------------------------------------ titre
     m = (re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', text)
@@ -139,10 +139,10 @@ def parse_details(text, mal_id):
             t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
             det["title"] = _clean(t)
 
-    # ------------------------------------------- type / statut / vol. / ch.
+    # ------------------------------------------- type / statut / épisodes
     # motif indépendant des classes CSS : « Libellé:</balise éventuelle> valeur »
     for label, field in (("Type", "type"), ("Status", "status"),
-                         ("Volumes", "volumes"), ("Chapters", "chapters")):
+                         ("Episodes", "episodes")):
         m = re.search(label + r":\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
         if m:
             det[field] = _clean(html_lib.unescape(m.group(1)))
@@ -210,17 +210,23 @@ def announce(det):
     embed = {
         "title": det.get("title") or f"Nouvelle entrée #{det['mal_id']}",
         "url": f"{MAL_ANIME}{det['mal_id']}",
-        "color": 0x2E51A2,
-        "fields": [
-            {"name": "Type",   "value": det.get("type")   or "?", "inline": True},
-            {"name": "Statut", "value": det.get("status") or "?", "inline": True},
-        ],
+        "color": 0x2E51A2,                       # bleu anime
         "footer": {"text": f"MAL #{det['mal_id']}"},
     }
     if det.get("synopsis"):
-        embed["description"] = det["synopsis"][:300]
+        s = det["synopsis"]
+        if len(s) > 500:                         # coupure propre sur un mot
+            s = s[:500].rsplit(" ", 1)[0] + "…"
+        embed["description"] = s
+    champs = []
+    for nom, cle in (("Type", "type"), ("Statut", "status"), ("Épisodes", "episodes")):
+        val = _clean(str(det.get(cle) or ""))
+        if val and val not in ("?", "N/A", "Unknown"):
+            champs.append({"name": nom, "value": val, "inline": True})
+    if champs:
+        embed["fields"] = champs
     if det.get("image"):
-        embed["thumbnail"] = {"url": det["image"]}
+        embed["image"] = {"url": det["image"]}   # grande image SOUS l'embed
     ok = send_embed(embed)
     if ok:
         print(f"  -> notifié : #{det['mal_id']} — {embed['title']}")
