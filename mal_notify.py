@@ -7,7 +7,7 @@
   3. fiche introuvable (404) ou marquée « pending approval » -> file d'attente,
      re-vérifiée en rotation à chaque run ;
   4. fiche normale -> notif Discord (titre, type, statut, épisodes, synopsis,
-     image extraits de la page elle-même, multi-stratégies + auto-diagnostic).
+     image extraits de la page, multi-stratégies + auto-diagnostic).
 """
 
 import html as html_lib
@@ -35,6 +35,11 @@ WATCH_ROTATION = 12    # entrées de la file re-vérifiées par run
 WATCH_TTL_DAYS = 60    # abandon des entrées jamais validées
 WATCH_ALERT_SIZE = 60  # alerte Discord si la file dépasse cette taille
 ALERT_AFTER = 20       # runs d'affilée sans lecture de MAL avant alerte
+
+# valeurs possibles (MAL rend certains champs en JavaScript : on cherche
+# ces valeurs littérales dans la page pour retrouver les vraies données)
+STATUTS = ("Currently Airing", "Finished Airing", "Not yet aired")
+TYPES   = ("TV", "Movie", "OVA", "ONA", "Special", "Music", "TV Special")
 
 # formulations signalant une entrée pas encore validée (en minuscules)
 PENDING_HINTS = [
@@ -108,13 +113,14 @@ def _clean(s):
 
 def parse_details(text, mal_id):
     """Titre / type / statut / épisodes / synopsis / image — multi-stratégies :
-    meta og: (stables), motifs texte insensibles aux classes CSS, secours.
-    En cas de champ manquant, un [diag] imprime l'extrait HTML exact
-    dans les logs (pour une correction factuelle, pas à l'aveugle)."""
+    meta og: (stables), motifs texte insensibles aux classes CSS, valeurs
+    littérales connues, JSON embarqué. Les gabarits JavaScript non rendus
+    (« ${ item.payload.status } ») sont rejetés. Un [diag] imprime l'extrait
+    HTML exact en cas de champ manquant (correction factuelle, pas à l'aveugle)."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
-           "episodes": "", "synopsis": "", "image": ""}
+           "episodes": "?", "synopsis": "", "image": ""}
 
     # ------------------------------------------------------------------ titre
     m = (re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', text)
@@ -139,13 +145,40 @@ def parse_details(text, mal_id):
             t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
             det["title"] = _clean(t)
 
-    # ------------------------------------------- type / statut / épisodes
-    # motif indépendant des classes CSS : « Libellé:</balise éventuelle> valeur »
-    for label, field in (("Type", "type"), ("Status", "status"),
-                         ("Episodes", "episodes")):
+    # --------------------------------------- type / statut / épisodes
+    def _brut(label):
+        """Valeur après « Libellé: » ; gabarits JS non rendus exclus."""
         m = re.search(label + r":\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
         if m:
-            det[field] = _clean(html_lib.unescape(m.group(1)))
+            v = _clean(html_lib.unescape(m.group(1)))
+            return "" if "${" in v else v
+        return ""
+
+    def _json(cle):
+        """Valeur d'une clé dans un JSON éventuellement embarqué dans la page."""
+        for m in re.finditer(r'"' + cle + r'"\s*:\s*"?([^",}\]]+)', text):
+            v = _clean(html_lib.unescape(m.group(1)))
+            if v and "${" not in v and v.lower() != "null" and "payload" not in v.lower():
+                return v
+        return ""
+
+    det["type"] = _brut("Type") or "?"
+    if det["type"] == "?":
+        j = _json("type")
+        if j in TYPES:
+            det["type"] = j
+
+    det["episodes"] = (_brut("Episodes") or _json("episodes")
+                       or _json("num_episodes") or "?")
+
+    statut = _brut("Status")
+    if not statut:                           # valeur littérale dans la page
+        statut = next((s for s in STATUTS if s in text), "")
+    if not statut:                           # JSON embarqué éventuel
+        j = _json("status")
+        if j in STATUTS:
+            statut = j
+    det["status"] = statut or "?"
 
     # -------------------------------------------------------------- synopsis
     p = (soup.select_one('p[itemprop="description"]')
@@ -171,7 +204,7 @@ def parse_details(text, mal_id):
                                 ("statut", det["status"])) if not v or v == "?"]
     if manquants:
         print(f"  [diag #{mal_id}] non trouvés : {', '.join(manquants)}")
-        for marqueur in ('og:title', "<h1", "Type:", "Status:"):
+        for marqueur in ('og:title', '<h1', 'Type:', 'Status:', '"status"'):
             i = text.find(marqueur)
             if i >= 0:
                 extrait = text[max(0, i - 40):i + 260].replace("\n", " ")
@@ -211,20 +244,18 @@ def announce(det):
         "title": det.get("title") or f"Nouvelle entrée #{det['mal_id']}",
         "url": f"{MAL_ANIME}{det['mal_id']}",
         "color": 0x2E51A2,                       # bleu anime
-        "footer": {"text": f"MAL #{det['mal_id']}"},
+        "footer": {"text": f"ANIME #{det['mal_id']}"},
     }
     if det.get("synopsis"):
         s = det["synopsis"]
         if len(s) > 500:                         # coupure propre sur un mot
             s = s[:500].rsplit(" ", 1)[0] + "…"
         embed["description"] = s
-    champs = []
-    for nom, cle in (("Type", "type"), ("Statut", "status"), ("Épisodes", "episodes")):
-        val = _clean(str(det.get(cle) or ""))
-        if val and val not in ("?", "N/A", "Unknown"):
-            champs.append({"name": nom, "value": val, "inline": True})
-    if champs:
-        embed["fields"] = champs
+    embed["fields"] = [                          # toujours affichés, « ? » si inconnu
+        {"name": "Type",     "value": det.get("type")     or "?", "inline": True},
+        {"name": "Statut",   "value": det.get("status")   or "?", "inline": True},
+        {"name": "Épisodes", "value": det.get("episodes") or "?", "inline": True},
+    ]
     if det.get("image"):
         embed["image"] = {"url": det["image"]}   # grande image SOUS l'embed
     ok = send_embed(embed)
