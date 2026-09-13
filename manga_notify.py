@@ -259,8 +259,8 @@ def announce(det, row=None):
     embed["fields"] = [
         {"name": "Type",     "value": typ,    "inline": True},
         {"name": "Statut",   "value": statut, "inline": True},
-        {"name": "Chapters", "value": ch,     "inline": True},
-        {"name": "Volumes",  "value": vol,    "inline": True},
+        {"name": "Chapter" if ch == "1" else "Chapters", "value": ch, "inline": True},
+        {"name": "Volume" if vol == "1" else "Volumes",  "value": vol, "inline": True},
     ]
     if det.get("image"):
         embed["image"] = {"url": det["image"]}
