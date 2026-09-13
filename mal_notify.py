@@ -154,20 +154,22 @@ def parse_details(text, mal_id):
             return "" if "${" in v else v
         return ""
 
-    def _json(cle):
-        """Valeur d'une clé dans un JSON éventuellement embarqué dans la page."""
+    def _json(cle, autorises=None):
+        """Valeur d'une clé dans un JSON éventuellement embarqué dans la page.
+        Une page contient souvent PLUSIEURS occurrences de la clé (config du
+        lecteur vidéo, analytics…) : on les parcourt TOUTES et on renvoie la
+        première valeur plausible — et, si des valeurs autorisées sont
+        fournies, la première qui en fait partie."""
         for m in re.finditer(r'"' + cle + r'"\s*:\s*"?([^",}\]]+)', text):
             v = _clean(html_lib.unescape(m.group(1)))
-            if v and "${" not in v and v.lower() != "null" and "payload" not in v.lower():
-                return v
+            if not v or "${" in v or v.lower() == "null" or "payload" in v.lower():
+                continue
+            if autorises is not None and v not in autorises:
+                continue
+            return v
         return ""
 
-    det["type"] = _brut("Type") or "?"
-    if det["type"] == "?":
-        j = _json("type")
-        if j in TYPES:
-            det["type"] = j
-
+    det["type"] = _brut("Type") or _json("type", TYPES) or "?"
     det["episodes"] = (_brut("Episodes") or _json("episodes")
                        or _json("num_episodes") or "?")
 
@@ -175,9 +177,7 @@ def parse_details(text, mal_id):
     if not statut:                           # valeur littérale dans la page
         statut = next((s for s in STATUTS if s in text), "")
     if not statut:                           # JSON embarqué éventuel
-        j = _json("status")
-        if j in STATUTS:
-            statut = j
+        statut = _json("status", STATUTS)
     det["status"] = statut or "?"
 
     # -------------------------------------------------------------- synopsis
@@ -204,6 +204,11 @@ def parse_details(text, mal_id):
                                 ("statut", det["status"])) if not v or v == "?"]
     if manquants:
         print(f"  [diag #{mal_id}] non trouvés : {', '.join(manquants)}")
+        if "type" in manquants:              # preuves : toutes les valeurs « type »
+            cands = [_clean(html_lib.unescape(m.group(1)))
+                     for m in re.finditer(r'"type"\s*:\s*"?([^",}\]]+)', text)]
+            print(f'  [diag] valeurs "type" présentes dans la page : '
+                  f'{[c for c in cands if c and "${" not in c][:10]}')
         for marqueur in ('og:title', '<h1', 'Type:', 'Status:', '"status"'):
             i = text.find(marqueur)
             if i >= 0:
