@@ -33,6 +33,11 @@ WATCH_TTL_DAYS = 60
 WATCH_ALERT_SIZE = 60
 ALERT_AFTER = 20
 
+# valeurs possibles (MAL rend certains champs en JavaScript : on cherche
+# ces valeurs littérales dans la page pour retrouver les vraies données)
+STATUTS = ("Not yet published", "Publishing", "Discontinued", "On Hiatus", "Finished")
+TYPES   = ("Manga", "Manhwa", "Manhua", "Novel", "Light Novel", "One-shot", "Doujinshi")
+
 PENDING_HINTS = [
     "pending approval",
     "not yet been approved",
@@ -103,13 +108,14 @@ def _clean(s):
 
 def parse_details(text, mal_id):
     """Titre / type / statut / volumes / chapitres / synopsis / image —
-    multi-stratégies : meta og: (stables), motifs texte insensibles aux classes
-    CSS, secours. En cas de champ manquant, un [diag] imprime l'extrait HTML
-    exact dans les logs (pour une correction factuelle, pas à l'aveugle)."""
+    multi-stratégies : meta og:, motifs texte, valeurs littérales connues,
+    JSON embarqué. Les gabarits JavaScript non rendus
+    (« ${ item.payload.status } ») sont rejetés. Un [diag] imprime l'extrait
+    HTML exact en cas de champ manquant (correction factuelle)."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
-           "volumes": "", "chapters": "", "synopsis": "", "image": ""}
+           "volumes": "?", "chapters": "?", "synopsis": "", "image": ""}
 
     # ------------------------------------------------------------------ titre
     m = (re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', text)
@@ -134,13 +140,42 @@ def parse_details(text, mal_id):
             t = re.sub(r"\s*[-–—|]\s*MyAnimeList(\.net)?\s*$", "", t)
             det["title"] = _clean(t)
 
-    # ------------------------------------------- type / statut / vol. / ch.
-    # motif indépendant des classes CSS : « Libellé:</balise éventuelle> valeur »
-    for label, field in (("Type", "type"), ("Status", "status"),
-                         ("Volumes", "volumes"), ("Chapters", "chapters")):
+    # ------------------------------- type / statut / volumes / chapitres
+    def _brut(label):
+        """Valeur après « Libellé: » ; gabarits JS non rendus exclus."""
         m = re.search(label + r":\s*(?:</[a-z]+>|<[^>]*>)?\s*([^<]+)", text)
         if m:
-            det[field] = _clean(html_lib.unescape(m.group(1)))
+            v = _clean(html_lib.unescape(m.group(1)))
+            return "" if "${" in v else v
+        return ""
+
+    def _json(cle):
+        """Valeur d'une clé dans un JSON éventuellement embarqué dans la page."""
+        for m in re.finditer(r'"' + cle + r'"\s*:\s*"?([^",}\]]+)', text):
+            v = _clean(html_lib.unescape(m.group(1)))
+            if v and "${" not in v and v.lower() != "null" and "payload" not in v.lower():
+                return v
+        return ""
+
+    det["type"] = _brut("Type") or "?"
+    if det["type"] == "?":
+        j = _json("type")
+        if j in TYPES:
+            det["type"] = j
+
+    det["chapters"] = (_brut("Chapters") or _json("chapters")
+                       or _json("num_chapters") or "?")
+    det["volumes"] = (_brut("Volumes") or _json("volumes")
+                      or _json("num_volumes") or "?")
+
+    statut = _brut("Status")
+    if not statut:                           # valeur littérale dans la page
+        statut = next((s for s in STATUTS if s in text), "")
+    if not statut:                           # JSON embarqué éventuel
+        j = _json("status")
+        if j in STATUTS:
+            statut = j
+    det["status"] = statut or "?"
 
     # -------------------------------------------------------------- synopsis
     p = (soup.select_one('p[itemprop="description"]')
@@ -166,7 +201,7 @@ def parse_details(text, mal_id):
                                 ("statut", det["status"])) if not v or v == "?"]
     if manquants:
         print(f"  [diag #{mal_id}] non trouvés : {', '.join(manquants)}")
-        for marqueur in ('og:title', "<h1", "Type:", "Status:"):
+        for marqueur in ('og:title', '<h1', 'Type:', 'Status:', '"status"'):
             i = text.find(marqueur)
             if i >= 0:
                 extrait = text[max(0, i - 40):i + 260].replace("\n", " ")
@@ -213,14 +248,12 @@ def announce(det):
         if len(s) > 500:                         # coupure propre sur un mot
             s = s[:500].rsplit(" ", 1)[0] + "…"
         embed["description"] = s
-    champs = []
-    for nom, cle in (("Type", "type"), ("Statut", "status"),
-                     ("Chapters", "chapters"), ("Volumes", "volumes")):
-        val = _clean(str(det.get(cle) or ""))
-        if val and val not in ("?", "N/A", "Unknown"):
-            champs.append({"name": nom, "value": val, "inline": True})
-    if champs:
-        embed["fields"] = champs
+    embed["fields"] = [                          # toujours affichés, « ? » si inconnu
+        {"name": "Type",     "value": det.get("type")     or "?", "inline": True},
+        {"name": "Statut",   "value": det.get("status")   or "?", "inline": True},
+        {"name": "Chapters", "value": det.get("chapters") or "?", "inline": True},
+        {"name": "Volumes",  "value": det.get("volumes")  or "?", "inline": True},
+    ]
     if det.get("image"):
         embed["image"] = {"url": det["image"]}   # grande image SOUS l'embed
     ok = send_embed(embed)
