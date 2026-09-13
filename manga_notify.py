@@ -19,7 +19,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # ------------------------------------------------------------------ réglages
-MANGA_PAGE = "https://myanimelist.net/manga.php?o=9&c%5B0%5D=a&c%5B1%5D=d&cv=2&w=1"
+MANGA_PAGE = "https://myanimelist.net/manga.php?o=9&c%5B0%5D=a&c%5B1%5D=b&c%5B2%5D=c&cv=3&w=1"
 MANGA_BASE = "https://myanimelist.net/manga/"
 WEBHOOK = os.environ.get("WEBHOOK_MANGA_URL") or os.environ["WEBHOOK_URL"]
 
