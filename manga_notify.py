@@ -4,8 +4,7 @@ la page « nouvelles entrées » manga et les fiches myanimelist.net/manga/<ID>
 sont lues directement sur MAL ; les entrées non validées attendent en file.
 
 État indépendant : state_manga.json.
-Webhook : le même que les animes par défaut ; un secret optionnel
-WEBHOOK_MANGA_URL permet d'envoyer les mangas dans un autre salon.
+Webhook : WEBHOOK_MANGA_URL si défini, sinon WEBHOOK_URL (salon animes).
 """
 
 import html as html_lib
@@ -103,10 +102,10 @@ def _clean(s):
     return re.sub(r"\s+", " ", s or "").strip()
 
 def parse_details(text, mal_id):
-    """Titre / type / statut / synopsis / image — multi-stratégies :
-    meta og: (stables), motifs texte insensibles aux classes CSS, secours.
-    En cas de champ manquant, un [diag] imprime l'extrait HTML exact
-    dans les logs (pour une correction factuelle, pas à l'aveugle)."""
+    """Titre / type / statut / volumes / chapitres / synopsis / image —
+    multi-stratégies : meta og: (stables), motifs texte insensibles aux classes
+    CSS, secours. En cas de champ manquant, un [diag] imprime l'extrait HTML
+    exact dans les logs (pour une correction factuelle, pas à l'aveugle)."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
@@ -206,22 +205,24 @@ def announce(det):
     embed = {
         "title": det.get("title") or f"Nouvelle entrée #{det['mal_id']}",
         "url": f"{MANGA_BASE}{det['mal_id']}",
-        "color": 0x8E44AD,
-        "fields": [
-            {"name": "Type",   "value": det.get("type")   or "?", "inline": True},
-            {"name": "Statut", "value": det.get("status") or "?", "inline": True},
-        ],
+        "color": 0x8E44AD,                       # violet manga
         "footer": {"text": f"MANGA #{det['mal_id']}"},
     }
-    vol, ch = det.get("volumes"), det.get("chapters")
-    if vol or ch:
-        embed["fields"].append(
-            {"name": "Vol. / Ch.", "value": f"{vol or '?'} vol. · {ch or '?'} ch.",
-             "inline": True})
     if det.get("synopsis"):
-        embed["description"] = det["synopsis"][:300]
+        s = det["synopsis"]
+        if len(s) > 500:                         # coupure propre sur un mot
+            s = s[:500].rsplit(" ", 1)[0] + "…"
+        embed["description"] = s
+    champs = []
+    for nom, cle in (("Type", "type"), ("Statut", "status"),
+                     ("Chapters", "chapters"), ("Volumes", "volumes")):
+        val = _clean(str(det.get(cle) or ""))
+        if val and val not in ("?", "N/A", "Unknown"):
+            champs.append({"name": nom, "value": val, "inline": True})
+    if champs:
+        embed["fields"] = champs
     if det.get("image"):
-        embed["thumbnail"] = {"url": det["image"]}
+        embed["image"] = {"url": det["image"]}   # grande image SOUS l'embed
     ok = send_embed(embed)
     if ok:
         print(f"  -> notifié : #{det['mal_id']} — {embed['title']}")
