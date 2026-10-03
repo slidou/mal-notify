@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: mal-notify
-  cancel-in-progress: true
+  cancel-in-progress: false   # ne JAMAIS tuer un run en cours : le suivant attend
 
 jobs:
   check:
@@ -25,11 +25,12 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
       - run: python manga_notify.py
-        continue-on-error: true   # un souci manga ne doit jamais bloquer les animes
+        continue-on-error: true
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_MANGA_URL: ${{ secrets.WEBHOOK_MANGA_URL }}
       - name: Sauvegarder l'état
+        if: always()          # préserver la progression même si une étape échoue
         run: |
           git config user.name  "mal-notify-bot"
           git config user.email "actions@users.noreply.github.com"
