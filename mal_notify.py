@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""mal-notify v2 — plus aucune dépendance à Jikan : tout est lu sur MAL en direct.
+"""mal-notify v3.1 — tout est lu sur MAL en direct (aucune dépendance à Jikan).
 
-  1. la page « nouvelles entrées » est scrapée : IDs + infos de LIGNE
-     (type, épisodes) de la table de résultats — rendue côté serveur ;
-  2. pour chaque ID inconnu, la fiche myanimelist.net/anime/<ID> est chargée :
-     titre/synopsis/image via les meta og:, statut via valeur littérale ;
-  3. fiche introuvable (404) ou marquée « pending approval » -> file d'attente,
-     re-vérifiée en rotation à chaque run ;
-  4. fiche normale -> notif Discord (type/épisodes de la table, reste de la
-     fiche) + auto-diagnostic [diag] si un champ manque.
+  1. page « nouvelles entrées » scrapée sur ~200 entrées de profondeur :
+     IDs + infos de ligne (type, épisodes) de la table, rendue côté serveur ;
+  2. FILET DE SÉCURITÉ : tout ID jamais vu entre immédiatement dans la file —
+     même si ce run ne peut pas le traiter, il restera surveillé après sa
+     sortie de la fenêtre (fini les entrées perdues en transit) ;
+  3. ROTATION ÉQUITABLE : chaque run re-vérifie les entrées de file les moins
+     souvent vérifiées. (v2/v3 vérifiaient les plus ANCIENNES : des entrées
+     en attente monopolisaient les créneaux et des entrées validées placées
+     derrière n'étaient jamais re-vérifiées — donc jamais notifiées) ;
+  4. état sauvegardé après CHAQUE notification (progression préservée même
+     si le run est interrompu en plein milieu).
 """
 
 import html as html_lib
@@ -28,13 +31,13 @@ MAL_ANIME = "https://myanimelist.net/anime/"
 WEBHOOK = os.environ["WEBHOOK_URL"]
 
 STATE_FILE = Path("state.json")
-SHOW_OFFSETS = [0, 20, 40]
+SHOW_OFFSETS = [0, 40, 80, 120, 160]     # 5 pages -> ~200 dernières entrées
 
 MAX_NOTIFS = 10        # embeds max envoyés par run
-MAX_FETCHES = 15       # fiches MAL max consultées par run
-WATCH_ROTATION = 12    # entrées de la file re-vérifiées par run
-WATCH_TTL_DAYS = 60    # abandon des entrées jamais validées
-WATCH_ALERT_SIZE = 60  # alerte Discord si la file dépasse cette taille
+MAX_FETCHES = 20       # fiches MAL max consultées par run
+WATCH_ROTATION = 12    # entrées de file re-vérifiées par run (équitablement)
+WATCH_TTL_DAYS = 120   # abandon des entrées jamais validées
+WATCH_ALERT_SIZE = 150 # alerte Discord si la file dépasse cette taille
 ALERT_AFTER = 20       # runs d'affilée sans lecture de MAL avant alerte
 
 STATUTS = ("Currently Airing", "Finished Airing", "Not yet aired")
@@ -77,8 +80,7 @@ def _fetch_plain(url):
     return r.text, r.status_code
 
 def get_page(url):
-    """(html, code HTTP) via curl_cffi / cloudscraper / requests, en cascade.
-    Lève RuntimeError si les trois méthodes sont bloquées."""
+    """(html, code HTTP) via curl_cffi / cloudscraper / requests, en cascade."""
     last = "aucune méthode n'a abouti"
     for fetch in (_fetch_cffi, _fetch_scraper, _fetch_plain):
         try:
@@ -143,8 +145,7 @@ def _clean(s):
 
 def parse_details(text, mal_id):
     """Titre / synopsis / image / statut depuis la fiche (multi-stratégies).
-    Le type et les épisodes viennent de la table de recherche (voir
-    scrape_window) — MAL ne sert pas ces champs en HTML sur la fiche."""
+    Type et épisodes viennent de la table de recherche (voir scrape_window)."""
 
     soup = BeautifulSoup(text, "html.parser")
     det = {"mal_id": mal_id, "title": "", "type": "?", "status": "?",
@@ -201,7 +202,6 @@ def parse_details(text, mal_id):
     if m:
         det["image"] = m.group(1)
 
-    # ------------------------------------------- diagnostic auto si besoin
     if not det["title"]:
         print(f"  [diag #{mal_id}] titre introuvable")
         i = text.find("og:title")
@@ -241,11 +241,11 @@ def announce(det, row=None):
     row = row or {}
     typ = det.get("type") or "?"
     if typ == "?":
-        typ = row.get("type") or "?"          # type de la table de recherche
+        typ = row.get("type") or "?"
     statut = det.get("status") or "?"
     eps = det.get("episodes") or "?"
     if eps == "?":
-        eps = row.get("eps") or "?"           # épisodes de la table de recherche
+        eps = row.get("eps") or "?"
     embed = {
         "title": det.get("title") or f"Nouvelle entrée #{det['mal_id']}",
         "url": f"{MAL_ANIME}{det['mal_id']}",
@@ -273,7 +273,7 @@ def announce(det, row=None):
 def main():
     state = load_state()
 
-    # 1) fenêtre des nouvelles entrées --------------------------------------
+    # 1) fenêtre des nouvelles entrées (~200 de profondeur) ------------------
     try:
         window, infos = scrape_window()
         if len(window) < 10:
@@ -316,27 +316,44 @@ def main():
             del watch[mal_id]
             notified.add(mal_id)
 
-    # 4) file d'attente anormalement grande ? --------------------------------
+    # 4) nouveaux IDs de la fenêtre -------------------------------------------
+    fresh = [i for i in window if i not in notified and i not in watch]
+
+    # 4bis) FILET DE SÉCURITÉ : tout ID nouveau entre dans la file MAINTENANT,
+    #       même si ce run n'a pas le temps de le traiter — sinon une entrée
+    #       qui quitte la fenêtre avant d'être traitée serait perdue sans retour
+    for mal_id in fresh:
+        watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0,
+                                  "row": infos.get(mal_id) or {}})
+
+    # 5) file anormalement grande ? -------------------------------------------
     if len(watch) > WATCH_ALERT_SIZE and not state.get("watch_alerted"):
         send_embed({"title": "⚠️ mal-notify : file d'attente suspicieusement grande",
-                    "description": f"{len(watch)} entrées bloquées en attente. Vérifie "
-                                   "les logs (onglet Actions) du repo.",
+                    "description": f"{len(watch)} entrées en file. C'est peut-être "
+                                   "normal (beaucoup de soumissions en attente côté "
+                                   "MAL), mais vérifie les logs au cas où.",
                     "color": 0xE67E22})
         state["watch_alerted"] = True
-    elif len(watch) < 30:
+    elif len(watch) < 100:
         state["watch_alerted"] = False
 
-    # 5) examen : nouveaux IDs d'abord, puis rotation de la file -------------
-    fresh = [i for i in window if i not in notified and i not in watch]
     print(f"{len(fresh)} nouvel(s) ID, {len(watch)} en file d'attente")
 
-    queue = list(reversed(fresh))
-    queue += sorted(watch, key=lambda i: watch[i].get("since", ""))[:WATCH_ROTATION]
+    # 6) examen : nouveaux IDs d'abord, puis ROTATION ÉQUITABLE de la file ----
+    #    (les entrées les moins souvent vérifiées passent d'abord — fini la
+    #    famine derrière les entrées anciennes)
+    fresh_set = set(fresh)
+    rotation = sorted((i for i in watch if i not in fresh_set),
+                      key=lambda i: (watch[i].get("tries", 0),
+                                     watch[i].get("since", "")))[:WATCH_ROTATION]
+    queue = list(dict.fromkeys(list(reversed(fresh)) + rotation))
 
     fetches = sent = 0
     for mal_id in queue:
         if fetches >= MAX_FETCHES or sent >= MAX_NOTIFS:
             break
+        if mal_id in notified:            # déjà traité plus haut dans ce run
+            continue
         fetches += 1
         time.sleep(1.4)
         row = infos.get(mal_id) or watch.get(mal_id, {}).get("row") or {}
@@ -346,18 +363,24 @@ def main():
                 notified.add(mal_id)
                 watch.pop(mal_id, None)
                 sent += 1
-        elif classe == "error":
-            print(f"  #{mal_id} : lecture impossible ({det.get('error', '?')})")
-            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0, "row": row})
-            info["since"] = now.isoformat()
+                state["notified"] = sorted(notified, key=int)[-2000:]
+                save_state(state)         # progression préservée si crash
         else:
-            info = watch.setdefault(mal_id, {"since": now.isoformat(), "tries": 0, "row": row})
+            info = watch.setdefault(mal_id, {"since": now.isoformat(),
+                                             "tries": 0, "row": row})
             info["tries"] += 1
-            raison = ("page absente" if classe == "missing"
-                      else f"en attente de validation ({det.get('hint')})")
-            print(f"  #{mal_id} : {raison} — essai {info['tries']}")
+            if classe == "error":
+                print(f"  #{mal_id} : lecture impossible ({det.get('error', '?')}) "
+                      f"— essai {info['tries']}")
+            else:
+                raison = ("page absente" if classe == "missing"
+                          else f"en attente de validation ({det.get('hint')})")
+                print(f"  #{mal_id} : {raison} — essai {info['tries']}")
+            if info["tries"] % 50 == 0:
+                print(f"  [diag] #{mal_id} : toujours non validée après "
+                      f"{info['tries']} vérifications — vérifie la page à la main")
 
-    # 6) sauvegarde -----------------------------------------------------------
+    # 7) sauvegarde finale ------------------------------------------------------
     state["notified"] = sorted(notified, key=int)[-2000:]
     state["watch"] = watch
     save_state(state)
